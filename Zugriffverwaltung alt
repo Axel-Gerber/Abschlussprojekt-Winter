@@ -1,0 +1,113 @@
+import PySimpleGUI as sg
+import subprocess
+import os
+import mysql.connector
+from mysql.connector import Error
+
+# Funktion zum Ausführen des PowerShell-Skripts
+def create_share(folder_path, user_name, access_right):
+    share_name = os.path.basename(folder_path)
+
+    powershell_script = f"""
+if (-Not (Test-Path -Path '{folder_path}')) {{
+    New-Item -ItemType Directory -Path '{folder_path}'
+    Write-Output "Ordner '{folder_path}' erstellt."
+}}
+
+New-SmbShare -Name '{share_name}' -Path '{folder_path}' -FullAccess '{user_name}'
+
+Write-Output "Freigabe '{share_name}' für Ordner '{folder_path}' erstellt und Benutzer '{user_name}' mit '{access_right}' Zugriff hinzugefügt."
+
+$acl = Get-Acl -Path '{folder_path}'
+$accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule('{user_name}', '{access_right}', "ContainerInherit, ObjectInherit", "None", "Allow")
+$acl.SetAccessRule($accessRule)
+Set-Acl -Path '{folder_path}' -AclObject $acl
+
+Write-Output "NTFS-Berechtigungen für Benutzer '{user_name}' auf Ordner '{folder_path}' gesetzt."
+"""
+
+    try:
+        # Führen Sie das PowerShell-Skript aus und fangen Sie die Ausgabe und Fehler ab
+        result = subprocess.run(["powershell", "-Command", powershell_script], capture_output=True, text=True, shell=True)
+        if result.returncode != 0:
+            sg.popup_error("Fehler", f"Fehler beim Ausführen des PowerShell-Skripts:\n{result.stderr}")
+        else:
+            sg.popup("Erfolg", "Freigabe wurde erfolgreich erstellt")
+            # Speichern der Daten in der Datenbank
+            save_to_database(folder_path, user_name, access_right)
+    except subprocess.CalledProcessError as e:
+        sg.popup_error("Fehler", f"Fehler beim Ausführen des PowerShell-Skripts: {e}")
+
+# Funktion zum Speichern der Daten in der MySQL-Datenbank
+def save_to_database(folder_path, user_name, access_right):
+    try:
+        connection = mysql.connector.connect(    # Aufbau Verbindung/Anmeldung zum SQL-Server
+            host='localhost',
+            database='verwaltung',
+            user='root',
+            password='root123',
+            auth_plugin='mysql_native_password'  # Authentifizierungsplugin zur Vermeidung von Verbindungsfehlern
+        )
+        if connection.is_connected():
+            cursor = connection.cursor()         # Erstellen einer neuen Tabelle
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS Zugriff (      
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    Path VARCHAR(255) NOT NULL,
+                    UserName VARCHAR(255) NOT NULL,
+                    Access VARCHAR(255) NOT NULL
+                )
+            """)
+            cursor.execute("""
+                INSERT INTO Zugriff (Path, UserName, Access)
+                VALUES (%s, %s, %s)
+            """, (folder_path, user_name, access_right))
+            connection.commit()                                        # Daten in die neue Tabelle speichern
+            sg.popup("Datenbank", "Daten erfolgreich gespeichert")
+    except Error as e:
+        sg.popup_error("Datenbankfehler", f"Fehler beim Speichern in der Datenbank: {e}")
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()                   # Abmelden vom SQL-Server           
+
+# Layout der GUI
+layout = [
+    [sg.Text("Ordnerpfad:"), sg.InputText(key="FolderPath", size=(50, 1))],
+    [sg.Text("Benutzername:"), sg.InputText(key="UserName", size=(50, 1))],
+    [sg.Text("Zugriffsrechte:")],
+    [sg.Checkbox("vollzugriff", key="FullControl"), sg.Checkbox("ändern", key="Change"), sg.Checkbox("lesen", key="Read")],
+    [sg.Button("Freigabe erstellen"), sg.Button("Abbrechen")]
+]
+
+# Fenster erstellen
+window = sg.Window("Freigabe erstellen", layout)
+
+# Schleife für die GUI
+while True:
+    event, values = window.read()
+    if event == sg.WIN_CLOSED or event == "Abbrechen":
+        break
+    if event == "Freigabe erstellen":
+        folder_path = values["FolderPath"]
+        user_name = values["UserName"]
+
+        access_rights = []
+        if values["FullControl"]:
+            access_rights.append("FullControl")
+        if values["Change"]:
+            access_rights.append("Change")
+        if values["Read"]:
+            access_rights.append("Read")
+
+        # Kombiniere die ausgewählten Zugriffsrechte
+        access_right = ','.join(access_rights)
+
+        if not folder_path or not user_name or not access_right:
+            sg.popup_warning("Eingabefehler", "Ordnerpfad, Benutzername und mindestens ein Zugriffsrecht müssen ausgefüllt werden")
+        else:
+            create_share(folder_path, user_name, access_right)
+
+# Fenster schließen
+window.close()
+
